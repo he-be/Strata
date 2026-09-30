@@ -42,6 +42,12 @@ struct SamplerParams {
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                    const SamplerParams& p, int* out, void* stream);
 
+// Constrained decoding (response_format): `mask` is (n_tokens, words) uint32 bitmaps, bit i of row t set = token i
+// may follow row t.  Every other logit of that row becomes -inf, so the sampler that runs next (greedy or sampled)
+// picks among the allowed tokens only.  `mask` may be device memory or mapped pinned host memory; ids at or past
+// words * 32 are masked off.  A row whose bits are all set is left as it was.
+void mask_logits(float* logits, int n_tokens, int n_vocab, const uint32_t* mask, int words, void* stream);
+
 // The penalty-history rows of a verify window, on the host: row t of `out` (T rows of `h` slots) is the last `h`
 // tokens of `tail[0..n_tail)` followed by `window[0..t]`, most recent LAST, -1 in the unused front slots.
 // `tail` is what the state consumed before the window, `window[0]` the fed-back token and `window[1..]` the

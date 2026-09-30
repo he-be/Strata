@@ -28,6 +28,7 @@
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "token_grammar.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/native_moe.hpp"
@@ -3113,6 +3114,17 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: the penalty-history allocation failed\n");
             return 1;
         }
+        // constrained decoding (grammar=): one allowed-token bitmap per verify-window row, mapped pinned memory the
+        // head's mask kernel reads directly; rewritten before every window of a constrained request
+        const int gmask_words = (int) ((n_vocab + 31) / 32);
+        uint32_t* h_gmask = nullptr;
+        uint32_t* d_gmask = nullptr;
+        if (cudaHostAlloc((void**) &h_gmask, (size_t) strata::kernels::kVerifyMaxT * (size_t) gmask_words * 4,
+                          cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+            cudaHostGetDevicePointer((void**) &d_gmask, h_gmask, 0) != cudaSuccess) {
+            std::fprintf(stderr, "strata serve: the grammar mask allocation failed\n");
+            return 1;
+        }
         strata::core::Verifier ver;
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
@@ -3534,7 +3546,8 @@ int main(int argc, char** argv) {
                     }
                 }).detach();
         }
-        std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
+        std::printf("READY %lld stop grammar\n", (long long) o.max_context);   // "stop": this engine honours STOP,
+                                                                          // "grammar": the grammar= key
         std::fflush(stdout);
         std::string line;
         int64_t rounds = 0;
@@ -3578,6 +3591,7 @@ int main(int argc, char** argv) {
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
+            std::string req_grammar;   // grammar=<file>: constrained decoding (token_grammar.hpp)
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -3602,6 +3616,7 @@ int main(int argc, char** argv) {
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
+                    else if (key == "grammar") req_grammar = tok.substr(eq + 1);
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -3618,6 +3633,13 @@ int main(int argc, char** argv) {
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
+            std::shared_ptr<strata::program::TokenGrammar> grammar;
+            if (!req_grammar.empty()) {
+                std::string ge;
+                grammar = strata::program::TokenGrammar::load(req_grammar, n_vocab, ge);
+                if (!grammar) { std::printf("ERR %s\n", ge.c_str()); continue; }
+            }
+            ver.set_token_mask(nullptr, 0);   // set again below, once the prompt is read, for a constrained request
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
             if (geni || !mrope_identity) {
@@ -4052,6 +4074,8 @@ int main(int argc, char** argv) {
             const int64_t decode_hits0 = drive.d.cache_hits;
             const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
             if (cancelled) finish = "cancel";
+            int32_t gstate = grammar ? grammar->initial() : 0;   // the grammar's state after x (the last emitted token)
+            ver.set_token_mask(grammar ? d_gmask : nullptr, gmask_words);
             while (!cancelled && produced_n < max_new) {
                 int T = S_mtp;
                 if (req_spec_min_p > 0.0) {
@@ -4091,6 +4115,20 @@ int main(int argc, char** argv) {
                     cudaMemcpy(d_hist, hist_stage.data(), (size_t) T * (size_t) hist_n * sizeof(int32_t),
                                cudaMemcpyHostToDevice);
                 }
+                if (grammar) {
+                    // row t picks the token after window[t]: its mask is the state after the drafts 1..t.  A draft
+                    // the grammar refuses cannot be accepted (the row before it picks an allowed token), so the
+                    // rows past it keep the last valid state's mask.
+                    int32_t s = gstate;
+                    for (int t = 0; t < T; ++t) {
+                        const std::vector<uint32_t>& m = grammar->mask(s);
+                        std::memcpy(h_gmask + (size_t) t * (size_t) gmask_words, m.data(), (size_t) gmask_words * 4);
+                        if (t + 1 < T) {
+                            const int32_t s2 = grammar->step(s, window[(size_t) t + 1]);
+                            if (s2 != -1) s = s2;
+                        }
+                    }
+                }
                 tr("window", p, T);
                 const Clock::time_point tw0 = Clock::now();
                 if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
@@ -4112,6 +4150,15 @@ int main(int argc, char** argv) {
                 }
                 // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
                 for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
+                if (grammar)
+                    for (int i = 0; i <= a; ++i) {
+                        const int32_t s2 = grammar->step(gstate, outv[(size_t) i]);
+                        if (s2 == -1) {
+                            std::fprintf(stderr, "strata serve: grammar: token %d left the grammar\n", (int) outv[(size_t) i]);
+                            break;
+                        }
+                        gstate = s2;
+                    }
                 draft_offered += T - 1;
                 draft_accepted += a;
                 first_window = false;

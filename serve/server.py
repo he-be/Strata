@@ -45,6 +45,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             images_of, openai_to_messages)
+from serve.grammar import GrammarFiles, schema_of  # noqa: E402
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 
 IM_END = "<|im_end|>"
@@ -168,6 +169,7 @@ class StrataEngine:
                                      stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
         self.max_context = 0
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
+        self.can_grammar = False         # ... and constrains decoding to a grammar file (READY <ctx> stop grammar)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.progress = None             # (read, total) prompt tokens while a prompt is read, from PP lines
@@ -184,6 +186,7 @@ class StrataEngine:
                 f = line.split()
                 self.max_context = int(f[1])
                 self.can_stop = "stop" in f[2:]
+                self.can_grammar = "grammar" in f[2:]   # the grammar= key: constrained decoding (serve/grammar.py)
                 break
         loading.set()
         if self.max_context <= 0:
@@ -294,6 +297,10 @@ class StrataEngine:
                 v = tune.get(k)
                 if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0:
                     keys += f" {k}={float(v)!r}"
+        # response_format: the grammar file Service.grammar_path wrote (a temp path, no spaces)
+        g = sampling.get("strata_grammar")
+        if isinstance(g, str) and g and " " not in g:
+            keys += f" grammar={g}"
         return keys + StrataEngine.projection_key(sampling)
 
     @staticmethod
@@ -575,6 +582,20 @@ class Service:
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
+        self.grammars = None                             # serve/grammar.py's files, made on the first response_format
+
+    def grammar_path(self, schema, thinking: bool) -> str:
+        """The engine's grammar file for a response_format schema (SchemaError, a ValueError, for what it cannot
+        constrain).  llama-server constrains its output to the schema; an engine that cannot is refused, since
+        ignoring response_format hands the client text that only looks like it asked for."""
+        if not getattr(self.engine, "can_grammar", False):
+            raise ValueError("this engine cannot constrain its output to a schema (response_format); "
+                             "build an engine with grammar support")
+        if self.grammars is None:
+            think = self.tok.encode("</think>")
+            self.grammars = GrammarFiles(Path(tempfile.mkdtemp(prefix="strata-grammar-")), self.tok,
+                                         sorted(self.stop_ids), think[0] if len(think) == 1 else None)
+        return str(self.grammars.path(schema, thinking))
 
     def set_shared(self, defaults) -> dict:
         """The Chat settings every client gets for what it leaves out; {} / None = clients use their own again."""
@@ -1437,6 +1458,11 @@ def make_handler(svc: Service):
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
+            schema = schema_of(req.get("response_format"))
+            if schema is not None:
+                if tools:
+                    raise ValueError("response_format together with tools is not supported")
+                req = {**req, "strata_grammar": svc.grammar_path(schema, thinking)}
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,

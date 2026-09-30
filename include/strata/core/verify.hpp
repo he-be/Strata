@@ -86,6 +86,14 @@ public:
         hist_len_ = history_len;
         if (next_) next_->set_history(history, history_len);
     }
+    /// Constrained decoding: before the head's pick, row t's logits are masked by row t of `mask` (kVerifyMaxT rows
+    /// of `words` uint32, device-visible - mapped pinned memory; the engine rewrites the rows before every window).
+    /// Null: no mask, the run is what it was.
+    void set_token_mask(const uint32_t* mask, int words) {
+        mask_d_ = mask;
+        mask_words_ = words;
+        if (next_) next_->set_token_mask(mask, words);
+    }
     /// Off: `run` skips the request's head sampling and `out` is the recorded greedy pick.  For windows whose
     /// picks are discarded - a prompt read through windows commits every token - so they cost no sampler launch
     /// or sync and never read a history staged for another position.
@@ -143,6 +151,8 @@ private:
     }();   ///< greedy by default; per-request via set_sampling
     const int32_t* hist_d_ = nullptr;   ///< penalty-history row (set_history); null = no penalties apply
     int hist_len_ = 0;
+    const uint32_t* mask_d_ = nullptr;   ///< set_token_mask; null = unconstrained
+    int mask_words_ = 0;
     bool head_sampling_ = true;          ///< set_head_sampling
     int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it (layer split)
     bool device_plan_ = false;            ///< E-6: resident-only layers planned on the device (STRATA_VERIFY_DEVICE_PLAN)

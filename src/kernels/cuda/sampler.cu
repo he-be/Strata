@@ -453,7 +453,28 @@ __global__ void sampler_split_merge_kernel(int n_vocab, const SamplerParams p, i
     if (threadIdx.x == 0) out[t] = pick;
 }
 
+__global__ void mask_logits_kernel(float* __restrict__ logits, int n_vocab, const uint32_t* __restrict__ mask,
+                                   int words) {
+    const int t = blockIdx.y;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_vocab) return;
+    const int w = i >> 5;
+    const bool on = w < words && ((mask[(size_t) t * (size_t) words + (size_t) w] >> (i & 31)) & 1u);
+    if (!on) logits[(size_t) t * (size_t) n_vocab + (size_t) i] = __int_as_float(0xff800000);   // -inf
+}
+
 }  // namespace
+
+void mask_logits(float* logits, int n_tokens, int n_vocab, const uint32_t* mask, int words, void* stream) {
+    if (n_tokens <= 0 || n_vocab <= 0) return;
+    mask_logits_kernel<<<dim3((unsigned) ((n_vocab + 255) / 256), (unsigned) n_tokens), 256, 0,
+                         (cudaStream_t) stream>>>(logits, n_vocab, mask, words);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "mask_logits launch: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
 
 int sampler_force_onepass = 0;   // LOCAL: the parity check runs both paths
 
