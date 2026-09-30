@@ -302,7 +302,160 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
     if (threadIdx.x == 0) out[t] = pick;
 }
 
+
+// ---- LOCAL (llm-server): the sampled chain in two passes, all SMs busy.
+// `sampler_kernel` puts one block per token over the whole vocabulary and runs k block-argmax rounds, so a verify
+// window of T rows uses T SMs: measured 3.6 ms per window on an RTX 3090 (12% of the window).  Pass 1 splits the
+// vocabulary into SPLIT_NB slices and keeps each slice's top k in the same total order (value descending, ties to
+// the LOWER index); pass 2 takes the top k of the SPLIT_NB x k candidates in that order.  The global top k of a
+// strict total order is the top k of the union of the slices' top k, so the kept list - set and order - is the
+// one-pass kernel's, and the chain after it is the same code on the same values.
+constexpr int SPLIT_NB = 96;
+constexpr int SPLIT_NT_MAX = 32;
+constexpr int SPLIT_KMAX = 64;
+__device__ float g_split_v[SPLIT_NT_MAX * SPLIT_NB * SPLIT_KMAX];
+__device__ int g_split_i[SPLIT_NT_MAX * SPLIT_NB * SPLIT_KMAX];
+
+/// block-wide (value desc, index asc) argmax; every thread returns the winner
+__device__ __forceinline__ void split_block_argmax(float& bv, int& best, float* sv, int* si, int n_none) {
+    for (int off = 16; off > 0; off >>= 1) {
+        const float ov = __shfl_down_sync(0xFFFFFFFFu, bv, off);
+        const int oi = __shfl_down_sync(0xFFFFFFFFu, best, off);
+        if (ov > bv || (ov == bv && oi < best)) { bv = ov; best = oi; }
+    }
+    const int warp = (int) (threadIdx.x >> 5), lane = (int) (threadIdx.x & 31);
+    if (lane == 0) { sv[warp] = bv; si[warp] = best; }
+    __syncthreads();
+    if (warp == 0) {
+        const int nw = (int) ((blockDim.x + 31) >> 5);
+        float wv = lane < nw ? sv[lane] : __int_as_float(0xff800000);
+        int wi = lane < nw ? si[lane] : n_none;
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_down_sync(0xFFFFFFFFu, wv, off);
+            const int oi = __shfl_down_sync(0xFFFFFFFFu, wi, off);
+            if (ov > wv || (ov == wv && oi < wi)) { wv = ov; wi = oi; }
+        }
+        if (lane == 0) { sv[0] = wv; si[0] = wi; }
+    }
+    __syncthreads();
+    bv = sv[0]; best = si[0];
+    __syncthreads();
+}
+
+__global__ void sampler_split_part_kernel(const float* __restrict__ logits, int n_vocab, const int* __restrict__ history,
+                                          int history_len, const SamplerParams p, int k) {
+    const int t = blockIdx.y, b = blockIdx.x;
+    const float* l = logits + (size_t) t * n_vocab;
+    const int chunk = (n_vocab + SPLIT_NB - 1) / SPLIT_NB;
+    const int v0 = b * chunk, v1 = min(n_vocab, v0 + chunk);
+    const int* hrow = history ? history + (size_t) t * history_len : nullptr;
+    int hlen = 0;
+    if (hrow) {
+        hlen = p.penalty_last_n < history_len ? p.penalty_last_n : history_len;
+        if (hlen < 0) hlen = 0;
+        hrow += history_len - hlen;
+    }
+    extern __shared__ unsigned int penal_bits[];
+    const int bits_words = (int) ((n_vocab + 31) / 32);
+    const bool use_bits = hrow != nullptr && hlen > 0 && bits_words > 0;
+    if (use_bits) {
+        for (int w = threadIdx.x; w < bits_words; w += blockDim.x) penal_bits[w] = 0u;
+        __syncthreads();
+        for (int i = threadIdx.x; i < hlen; i += blockDim.x)
+            if (hrow[i] >= 0 && hrow[i] < n_vocab) atomicOr(&penal_bits[hrow[i] >> 5], 1u << (hrow[i] & 31));
+        __syncthreads();
+    }
+    auto hit_count = [&](int v) -> int {
+        if (!use_bits || !(penal_bits[v >> 5] & (1u << (v & 31)))) return 0;
+        return history_count(hrow, hlen, v);
+    };
+    __shared__ int sel_ids[SPLIT_KMAX];
+    __shared__ float sv[32];
+    __shared__ int si[32];
+    float* ov = g_split_v + ((size_t) t * SPLIT_NB + b) * SPLIT_KMAX;
+    int* oi = g_split_i + ((size_t) t * SPLIT_NB + b) * SPLIT_KMAX;
+    for (int i = 0; i < k; ++i) {
+        float bv = __int_as_float(0xff800000);
+        int best = n_vocab;
+        for (int v = v0 + (int) threadIdx.x; v < v1; v += blockDim.x) {
+            bool taken = false;
+            for (int j = 0; j < i; ++j) if (sel_ids[j] == v) { taken = true; break; }
+            if (taken) continue;
+            const float s = apply_penalties(l[v], hit_count(v), p);
+            if (s > bv) { bv = s; best = v; }
+        }
+        split_block_argmax(bv, best, sv, si, n_vocab);
+        if (threadIdx.x == 0) { sel_ids[i] = best; ov[i] = bv; oi[i] = best; }
+        __syncthreads();
+    }
+}
+
+__global__ void sampler_split_merge_kernel(int n_vocab, const SamplerParams p, int k, int* __restrict__ out) {
+    const int t = blockIdx.x;
+    const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
+    const int nc = SPLIT_NB * k;
+    const float* cv = g_split_v + (size_t) t * SPLIT_NB * SPLIT_KMAX;
+    const int* ci = g_split_i + (size_t) t * SPLIT_NB * SPLIT_KMAX;
+    __shared__ int sel_ids[SPLIT_KMAX];
+    __shared__ float sel_logit[SPLIT_KMAX];
+    __shared__ float sv[32];
+    __shared__ int si[32];
+    for (int i = 0; i < k; ++i) {
+        float bv = __int_as_float(0xff800000);
+        int best = n_vocab;
+        for (int c = threadIdx.x; c < nc; c += blockDim.x) {
+            const int b = c / k, j = c - b * k;
+            const int id = ci[b * SPLIT_KMAX + j];
+            if (id >= n_vocab) continue;
+            bool taken = false;
+            for (int q = 0; q < i; ++q) if (sel_ids[q] == id) { taken = true; break; }
+            if (taken) continue;
+            const float s = cv[b * SPLIT_KMAX + j];
+            if (s > bv || (s == bv && id < best)) { bv = s; best = id; }
+        }
+        split_block_argmax(bv, best, sv, si, n_vocab);
+        if (threadIdx.x == 0) { sel_ids[i] = (best < n_vocab) ? best : 0; sel_logit[i] = bv; }
+        __syncthreads();
+    }
+    // ---- the rest of the chain: `sampler_kernel`'s code, unchanged
+    int n_keep = k;
+    float mx = sel_logit[0];
+    for (int i = 1; i < k; ++i) mx = fmaxf(mx, sel_logit[i]);
+    if (p.top_p < 1.0f) {
+        double sum = 0.0;
+        for (int i = 0; i < k; ++i) sum += exp((double) sel_logit[i] - (double) mx);
+        double cum = 0.0;
+        int cut = k;
+        for (int i = 0; i < k; ++i) {
+            cum += exp((double) sel_logit[i] - (double) mx) / sum;
+            if (cum >= (double) p.top_p) { cut = i + 1; break; }
+        }
+        if (cut < p.min_keep) cut = p.min_keep < k ? p.min_keep : k;
+        n_keep = cut;
+    }
+    if (p.min_p > 0.0f) {
+        const float thresh = sel_logit[0] + logf(p.min_p);
+        for (int i = 0; i < n_keep; ++i)
+            if (sel_logit[i] < thresh) { n_keep = i; break; }
+    }
+    auto scaled = [&](int i) { return sel_logit[i] * inv_t; };
+    float smx = scaled(0);
+    for (int i = 1; i < n_keep; ++i) smx = fmaxf(smx, scaled(i));
+    double sum = 0.0;
+    for (int i = 0; i < n_keep; ++i) sum += exp((double) scaled(i) - (double) smx);
+    const float u = philox_uniform(p.seed, p.counter + (uint64_t) t);
+    double cum = 0.0;
+    int pick = sel_ids[n_keep - 1];
+    for (int i = 0; i < n_keep; ++i) {
+        cum += exp((double) scaled(i) - (double) smx) / sum;
+        if ((double) u < cum) { pick = sel_ids[i]; break; }
+    }
+    if (threadIdx.x == 0) out[t] = pick;
+}
+
 }  // namespace
+
+int sampler_force_onepass = 0;   // LOCAL: the parity check runs both paths
 
 void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                    const SamplerParams& p, int* out, void* stream) {
@@ -323,8 +476,19 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
     } else {
         // The same block-per-token shape: the selection's k argmax rounds reduce inside the block.  See
         // `sampler_kernel`'s header for what the old one-thread-per-token launch cost.
-        sampler_kernel<<<(unsigned) n_tokens, 1024, shmem, (cudaStream_t) stream>>>(
-            logits, n_vocab, n_tokens, history, history_len, p, out);
+        // LOCAL: two passes over all SMs (see sampler_split_part_kernel).  STRATA_SAMPLER_ONEPASS=1, or a window
+        // wider than the candidate buffer, keeps the one-pass kernel.
+        static const bool onepass = std::getenv("STRATA_SAMPLER_ONEPASS") != nullptr;
+        int k = (p.top_k > 0 && p.top_k < SPLIT_KMAX) ? p.top_k : SPLIT_KMAX;
+        if (k > n_vocab) k = n_vocab;
+        if (!onepass && sampler_force_onepass == 0 && n_tokens <= SPLIT_NT_MAX && n_vocab >= SPLIT_NB * SPLIT_KMAX) {
+            sampler_split_part_kernel<<<dim3(SPLIT_NB, (unsigned) n_tokens), 256, shmem, (cudaStream_t) stream>>>(
+                logits, n_vocab, history, history_len, p, k);
+            sampler_split_merge_kernel<<<(unsigned) n_tokens, 256, 0, (cudaStream_t) stream>>>(n_vocab, p, k, out);
+        } else {
+            sampler_kernel<<<(unsigned) n_tokens, 1024, shmem, (cudaStream_t) stream>>>(
+                logits, n_vocab, n_tokens, history, history_len, p, out);
+        }
     }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
