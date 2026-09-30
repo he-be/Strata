@@ -70,7 +70,7 @@ DeviceInfo device_info(int ordinal) {
         throw CudaError("HIP backend requires validated gfx1100 wave32 hardware", -1);
     }
 #else
-    if (d.cc_major * 10 + d.cc_minor < 75) {
+    if (d.cc_major * 10 + d.cc_minor < 70) {
         throw CudaError("device " + d.name + " reports compute capability " + std::to_string(d.cc_major) +
                             "." + std::to_string(d.cc_minor) +
                             "; Strata needs compute capability 7.5 or newer (RTX 20 / 30 / 40 / 50 series)",

@@ -326,7 +326,7 @@ def cc(g) -> str:
 
 def gpu_problem(g, together=False):
     """Why Strata cannot use this card, in plain words (None: it can)."""
-    if int(g["arch"]) < 75:
+    if int(g["arch"]) < 70:
         return (f"not supported - older than the RTX 20 series (compute capability {cc(g)}; Strata needs 7.5 or "
                 "newer)")
     if together and g["vram_gb"] < SPLIT_MIN_VRAM_GB - 0.5:
