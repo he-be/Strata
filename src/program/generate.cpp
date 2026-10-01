@@ -1281,11 +1281,16 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --resident-cpu-experts requires --mmap-experts and a static --expert-profile\n");
         return 2;
     }
+    // local (llm-server): a layer split is allowed - the RAM complement leaves out what the stage caches hold
+    // (except their prompt-loan tails) and the adaptive swaps are off; helper caches are still refused
     if (o.resident_cpu_experts &&
-        (!o.layer_split.empty() || o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 ||
-         o.expert_cache_remote[2] > 0)) {
-        std::fprintf(stderr, "strata generate: --resident-cpu-experts does not support layer splits or remote expert caches\n");
+        (o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0)) {
+        std::fprintf(stderr, "strata generate: --resident-cpu-experts does not support remote expert caches\n");
         return 2;
+    }
+    if (o.resident_cpu_experts && !o.layer_split.empty() && o.adapt_every > 0) {
+        std::fprintf(stderr, "strata generate: resident RAM mode with a layer split: adaptive swaps off\n");
+        o.adapt_every = 0;
     }
     // the helper-GPU expert caches (--expert-cache-remote, docs/SECOND_GPU.md): CUDA1..3 on one GPU; with a layer
     // split, the visible GPUs no stage runs on, in order
@@ -3585,8 +3590,25 @@ int main(int argc, char** argv) {
             const int64_t k = plan_lend(chunk);
             if (k > 0) lend_from = xcache.slots() - k;
         }
-        if (src.pin_cache_complement(xcache, err, o.resident_pin, {}, lend_from, o.resident_headroom,
-                                     o.resident_budget, &profile)) {
+        // local (llm-server): experts a layer-split stage holds stay off the RAM budget (run with
+        // --no-prefill-borrow: a loaned slot's expert would be streamed from the files), and the budget ranks
+        // every stage's share of the profile, not only CUDA0's
+        std::vector<std::pair<int32_t, int32_t>> stage_pairs;
+        std::vector<std::pair<int32_t, int32_t>> rank_all = profile;
+        for (auto& st : stages) {
+            rank_all.insert(rank_all.end(), st->profile.begin(), st->profile.end());
+            for (int64_t l = st->lb; l < st->le; ++l)
+                for (int64_t e = 0; e < g.n_expert; ++e)
+                    if (st->cache.slot_of(l, e) >= 0) stage_pairs.emplace_back((int32_t) l, (int32_t) e);
+        }
+        if (!stages.empty() && !o.no_prefill_borrow)
+            std::fprintf(stderr, "strata generate: WARNING resident RAM mode with a layer split: without "
+                                 "--no-prefill-borrow the loaned slots' experts are read from the files\n");
+        if (!stage_pairs.empty())
+            std::fprintf(stderr, "strata generate: resident RAM mode: %zu experts held by split stages left out of the budget\n",
+                         stage_pairs.size());
+        if (src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from, o.resident_headroom,
+                                     o.resident_budget, &rank_all)) {
             if (o.adapt_every > 0 && o.adapt_swaps > 0 &&
                 !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 96), err)) {
                 std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str());

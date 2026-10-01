@@ -697,16 +697,19 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         static int cc_major[64] = {};
         int dev = 0;
         if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
+        // local: the capability as major*10 + minor - Volta (7.0) is major 7 too, but its build compiles the MMA
+        // to a trap (sm_75+), so it must keep the old kernel like the pre-7 cards
         if (cc_major[dev] == 0) {
-            int major = 0;
-            if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+            int major = 0, minor = 0;
+            if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+                cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
                 cudaGetLastError();
                 return false;
             }
-            cc_major[dev] = major;
+            cc_major[dev] = major * 10 + minor;
         }
-        if (cc_major[dev] < 7) return false;
-        turing = cc_major[dev] < 8;
+        if (cc_major[dev] < 75) return false;
+        turing = cc_major[dev] < 80;
     }
 #if defined(__HIPCC__)
     return false;   // the tensor-core kernel is compiled out on AMD (its major version is not a CUDA sm)
