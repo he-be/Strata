@@ -87,8 +87,14 @@ one later with `SETUP.bat` (the same as `START-HERE.bat --setup`; on Linux `./se
 For **OrcaRouter's Flash-Next Uncensored IQ3_XXS**, see the [manual compatibility setup](docs/ORCA.md).
 It needs an explicit packing conversion and is not an installer menu option.
 
+**Unsloth's 4-bit UD-Q4_K_XL** (experimental) is the fourth version in setup's menu (`--family unsloth`): the closest
+to the full model, but a 111 GB download whose 77 GB of experts do not fit in RAM. Strata keeps your RAM minus 24 GB
+of them in RAM and reads the rest from the SSD while it answers: 7-8.5 tokens/s on a 64 GB PC with a 12 GB GPU, several
+times slower than the sizes above, and long prompts are slow. It needs 48 GB of RAM or more, an NVMe SSD and one
+NVIDIA GPU (no images yet). Details and measurements: [UD-Q4_K_XL](docs/UNSLOTH_Q4.md).
+
 An **AMD Radeon RX 7900 XT / XTX, RX 9070 / 9070 XT or Radeon AI PRO R9700 on Linux** works too (experimental; the
-RX 7800 XT / 7700 XT and RX 9060 XT were validated by their owners):
+RX 7800 XT / 7700 XT and RX 9060 XT were validated by their owners; the RX 6800 / 6900 series, gfx1030, is community-reported):
 `./setup.sh --backend hip`, chosen by itself on a PC with no NVIDIA card Strata can use. It installs ROCm without sudo
 and compiles the engine (no images yet; several cards with `--gpus`). Details: [AMD HIP](docs/AMD_HIP.md).
 
@@ -155,7 +161,8 @@ the same way - nothing big is downloaded again.
    or name them with `-e GPUS=0,2` and where the later card's layers start with `-e LAYER_SPLIT=18`.
    A memory limit needs `-e LOW_RAM=on`, which maps the model's experts from the pack instead of
    keeping them in RAM: setup.py measures the host's RAM, not the container's limit, so it cannot
-   see a cap. LOW_RAM runs on one card.
+   see a cap. LOW_RAM runs on one card unless `GPUS` names several (then the experts the cards do not hold are
+   read through the OS file cache, which can fill the RAM during long prompts).
    The server listens on `0.0.0.0:8080` by default; set `-e API_KEY=<secret>` before exposing the port
    to a network. The image has a `HEALTHCHECK` on `/health`, so `docker ps` shows the container
    healthy once the model is loaded, and `GET /v1/status` says what it is running.
@@ -258,8 +265,9 @@ Want the full picture? The [details](docs/DETAILS.md#how-it-works) explain every
 
 - Model: [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team; compressed versions by
   [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF);
-  [Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF) by UkisAI. Their licenses apply
-  to the model files.
+  [Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF) by UkisAI; the experimental
+  [UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) by Unsloth (its support follows
+  [eddoursul/Strata](https://github.com/eddoursul/Strata)). Their licenses apply to the model files.
 - Built with parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT). Ideas from
   [Splash](https://github.com/incoai/splash), [ninfer](https://github.com/Neroued/ninfer) and
   [HyperQwen](https://github.com/syv-ai/HyperQwen). More in the [details](docs/DETAILS.md#credits-and-licenses).
