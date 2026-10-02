@@ -492,6 +492,33 @@ class ClientShapes(unittest.TestCase):
         self.assertEqual(list(v.dir.iterdir()), [])
         v.dir.rmdir()
 
+    def test_temp_dirs_of_dead_servers_are_swept(self):
+        # a killed server (OOM, SIGKILL, llama-swap's stop on Windows) left its dir in a tmpfs /tmp: RAM
+        import subprocess
+        from serve.server import Vision, temp_dir
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        prefix = "strata-sweep-test-"
+        root = Path(tempfile.gettempdir())
+        stale, live, other = root / f"{prefix}{dead.pid}-x", root / f"{prefix}{os.getppid()}-x", root / f"{prefix}y"
+        for d in (stale, live, other):
+            d.mkdir(exist_ok=True)
+        mine = temp_dir(prefix)
+        try:
+            self.assertFalse(stale.exists())
+            self.assertTrue(live.exists() and other.exists())
+            self.assertTrue(mine.name.startswith(f"{prefix}{os.getpid()}-"))
+        finally:
+            for d in (stale, live, other, mine):
+                if d.exists():
+                    d.rmdir()
+        v = Vision.__new__(Vision)                                  # close() removes the cache; unload() keeps it
+        v.dir, v.proc = temp_dir("strata-vision-test-"), mock.Mock(stdin=mock.Mock())
+        v.unload()
+        self.assertTrue(v.dir.exists())
+        v.close()
+        self.assertFalse(v.dir.exists())
+
     def test_leading_system_unchanged(self):
         from serve.frontend import anthropic_to_messages, openai_to_messages
         msgs, _, _ = openai_to_messages({"messages": [{"role": "developer", "content": "D"}, {"role": "user", "content": "u"}]})

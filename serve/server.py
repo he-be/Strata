@@ -31,6 +31,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -496,6 +497,35 @@ class StrataEngine:
                 self.progress, self.last = None, {}
 
 
+def pid_alive(pid: int) -> bool:
+    if os.name == "nt":
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        h = k32.OpenProcess(0x1000, False, pid)           # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return ctypes.get_last_error() == 5           # access denied: someone else's, running
+        code = ctypes.c_ulong()
+        ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
+        k32.CloseHandle(h)
+        return not ok or code.value == 259                # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def temp_dir(prefix: str) -> Path:
+    """A temp dir named after this process, after removing the ones a killed server left behind (llama-swap's
+    stop on Windows, SIGKILL, the OOM killer: no cleanup runs). /tmp is often a tmpfs, so a leftover is RAM."""
+    for d in Path(tempfile.gettempdir()).glob(prefix + "*"):
+        pid = d.name[len(prefix):].split("-", 1)[0]
+        if pid.isdigit() and int(pid) != os.getpid() and not pid_alive(int(pid)):
+            shutil.rmtree(d, ignore_errors=True)
+    return Path(tempfile.mkdtemp(prefix=f"{prefix}{os.getpid()}-"))
+
+
 class Vision:
     """The resident image encoder: `strata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
     lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
@@ -509,7 +539,7 @@ class Vision:
             args += ["--threads", str(cfg["threads"])]
         if cfg.get("max_tokens"):
             args += ["--max-tokens", str(cfg["max_tokens"])]
-        self.dir = Path(tempfile.mkdtemp(prefix="strata-vision-"))
+        self.dir = temp_dir("strata-vision-")
         self.spawn = (args, log, env)                   # to start it again after an unload
         self.stopped = False
         self._start()
@@ -531,7 +561,7 @@ class Vision:
 
     def unload(self):
         """Stop the encoder process (its VRAM or RAM goes back); the encoded images stay cached on disk."""
-        self.close()
+        self._stop()
         self.stopped = True
 
     def restart(self):
@@ -607,13 +637,17 @@ class Vision:
                 self.cache.pop(old)[0].unlink(missing_ok=True)
             return self.cache[key]
 
-    def close(self):
+    def _stop(self):
         try:
             self.proc.stdin.write("QUIT\n")
             self.proc.stdin.flush()
             self.proc.wait(timeout=10)
         except Exception:
             self.proc.kill()
+
+    def close(self):
+        self._stop()
+        shutil.rmtree(self.dir, ignore_errors=True)    # up to 64 cached embeddings; /tmp is often a tmpfs (RAM)
 
 
 def gpu_list(cfg: dict) -> list[int]:
@@ -781,7 +815,7 @@ class Service:
                              "build an engine with grammar support")
         if self.grammars is None:
             think = self.tok.encode("</think>")
-            self.grammars = GrammarFiles(Path(tempfile.mkdtemp(prefix="strata-grammar-")), self.tok,
+            self.grammars = GrammarFiles(temp_dir("strata-grammar-"), self.tok,
                                          sorted(self.stop_ids), think[0] if len(think) == 1 else None)
         return str(self.grammars.path(schema, thinking))
 
@@ -2576,7 +2610,8 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
         closers = [httpd.shutdown, getattr(engine, "close", None), vision.close if vision else None,
-                   hub.close if hub is not None else None]
+                   hub.close if hub is not None else None,
+                   (lambda: shutil.rmtree(svc.grammars.dir, ignore_errors=True)) if svc.grammars else None]
         for close in filter(None, closers):
             try:
                 close()
