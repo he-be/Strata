@@ -4,6 +4,7 @@
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
 // The HIP compatibility shim maps CUDA shuffle spellings to Strata helpers.
@@ -41,6 +42,24 @@ void ck(cublasStatus_t s, const char* what) {
         std::exit(1);
     }
 }
+
+#if !defined(__HIPCC__)
+// local (llm-server): BF16 -> FP16 for a card without BF16 tensor cores.  cuBLAS runs a BF16 GemmEx on a V100 (sm_70)
+// as magma_sgemmEx_kernel on the FP32 cores - measured 1.1 ms per call, 2.0 s of a 15K prompt's V100 stage against
+// 0.2 s of BF16 tensor-core GEMMs on the 3090 stage.  A BF16 value is exact in FP16 between 6.1e-5 and 65504
+// (BF16 has 8 significant bits, FP16 11): smaller ones round to FP16 subnormals, larger ones saturate at +-65504.
+__global__ void bf16_to_f16_kernel(const uint16_t* __restrict__ a, uint16_t* __restrict__ b, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v = __uint_as_float((uint32_t) a[i] << 16);
+    v = fminf(fmaxf(v, -65504.0f), 65504.0f);
+    b[i] = __half_as_ushort(__float2half_rn(v));
+}
+void bf16_to_f16(const uint16_t* a, uint16_t* b, int64_t n, cudaStream_t s) {
+    if (n <= 0) return;
+    bf16_to_f16_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(a, b, n);
+}
+#endif
 
 // A setup call whose failure the engine survives (the handle keeps its defaults), as before #240 - but said.
 void note(cublasStatus_t s, const char* what) {
@@ -363,6 +382,30 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     if (try_hipblaslt(hipblaslt_state_, strata::prefill::hipblaslt::InputType::bf16, X, W, Y, T, N, K, ldy,
                       beta, stream_)) {
+        return;
+    }
+#endif
+#if !defined(__HIPCC__)
+    if (bf16_via_f16_ < 0) {
+        int dev = 0, major = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        const char* v = std::getenv("STRATA_GEMM_BF16_F16");   // local: 0 keeps cuBLAS's BF16 path on any card
+        bf16_via_f16_ = major < 8 && !(v && std::atoi(v) == 0) ? 1 : 0;
+        if (bf16_via_f16_) std::fprintf(stderr, "prefill gemm: CUDA%d has no BF16 tensor cores - BF16 GEMMs run in FP16\n", dev);
+    }
+    // the weight first, then as many rows of X as the scratch holds after it
+    if (bf16_via_f16_ && scratch_ && N * K < scratch_elems_ && scratch_elems_ - N * K >= K) {
+        const cudaStream_t s = (cudaStream_t) stream_;
+        uint16_t* w16 = scratch_;
+        uint16_t* x16 = scratch_ + N * K;
+        const int64_t rows = (scratch_elems_ - N * K) / K;
+        bf16_to_f16(W, w16, N * K, s);
+        for (int64_t t0 = 0; t0 < T; t0 += rows) {
+            const int64_t nt = T - t0 < rows ? T - t0 : rows;
+            bf16_to_f16(X + t0 * K, x16, nt * K, s);
+            f16(x16, w16, Y + t0 * ldy, nt, N, K, ldy, beta);
+        }
         return;
     }
 #endif

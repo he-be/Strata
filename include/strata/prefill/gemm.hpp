@@ -52,6 +52,7 @@ private:
     void* workspace_ = nullptr;
     bool external_ = false;
     void* hipblaslt_state_ = nullptr;
+    int bf16_via_f16_ = -1;   ///< local: no BF16 tensor cores (sm_70) - BF16 operands converted to FP16 (-1: not asked yet)
 };
 
 

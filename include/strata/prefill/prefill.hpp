@@ -32,6 +32,12 @@ struct PrefillStats {
     int64_t experts_dma = 0;        ///< ...of which straight from the pinned arena (no CPU copy)
     int64_t experts_resident = 0;   ///< expert-layer groups served from the VRAM tier
     double ms_ple = 0;
+    // STRATA_PREFILL_TIMING: routed rows of the streamed / resident experts, and the streamed experts by rows
+    // (bins: 1, 2-4, 5-16, 17-64, 65+) with the bytes each bin streamed
+    int64_t rows_streamed = 0;
+    int64_t rows_resident = 0;
+    int64_t streamed_bin[5] = {};
+    double streamed_bin_mb[5] = {};
 };
 
 }  // namespace strata::prefill
