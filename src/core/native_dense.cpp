@@ -10,6 +10,16 @@
 #include <limits>
 #include <memory>
 #include <set>
+#if !defined(_WIN32)
+#include <atomic>
+#include <cstdlib>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace strata::core {
 namespace {
@@ -34,6 +44,67 @@ struct Pending {
     uint64_t bytes;
     DevicePtr data;
 };
+#if !defined(_WIN32)
+struct Upload {
+    void* dst;
+    uint64_t off;      ///< in the file
+    uint64_t bytes;
+};
+bool pread_uploads() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_LOAD_PREAD");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
+// The matrices read with pread() in 16 MiB chunks on 8 threads, each through a pinned buffer.  A cudaMemcpy from the
+// mapping faults the file in 4 KB at a time (2975 MiB in 7.0 s cold on llm-server's ZFS).  "" or the error.
+std::string upload_from_file(const std::string& path, const std::vector<Upload>& jobs) {
+    constexpr uint64_t kChunk = 16ull << 20;
+    struct Piece { void* dst; uint64_t off, bytes; };
+    std::vector<Piece> pieces;
+    for (const auto& j : jobs)
+        for (uint64_t at = 0; at < j.bytes; at += kChunk)
+            pieces.push_back({(uint8_t*) j.dst + at, j.off + at, std::min(kChunk, j.bytes - at)});
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) return "cannot open " + path;
+    int dev = 0;
+    (void) cudaGetDevice(&dev);
+    std::atomic<size_t> next{0};
+    std::mutex mu;
+    std::string err;
+    auto worker = [&] {
+        void* buf = nullptr;
+        std::string werr;
+        if (cudaSetDevice(dev) != cudaSuccess || cudaMallocHost(&buf, (size_t) kChunk) != cudaSuccess)
+            werr = std::string("staging buffer: ") + cudaGetErrorString(cudaGetLastError());
+        for (size_t i; werr.empty() && (i = next.fetch_add(1)) < pieces.size();) {
+            const Piece& p = pieces[i];
+            for (uint64_t got = 0; got < p.bytes;) {
+                const ssize_t r = ::pread(fd, (uint8_t*) buf + got, (size_t) (p.bytes - got), (off_t) (p.off + got));
+                if (r <= 0) { werr = "short read of " + path; break; }
+                got += (uint64_t) r;
+            }
+            if (werr.empty()) {
+                const cudaError_t e = cudaMemcpy(p.dst, buf, (size_t) p.bytes, cudaMemcpyHostToDevice);
+                if (e != cudaSuccess) werr = cudaGetErrorString(e);
+            }
+        }
+        if (buf != nullptr) (void) cudaFreeHost(buf);
+        if (!werr.empty()) {
+            std::lock_guard<std::mutex> lk(mu);
+            if (err.empty()) err = werr;
+            next.store(pieces.size());
+        }
+    };
+    std::vector<std::thread> pool;
+    for (int t = 1; t < 8; ++t) pool.emplace_back(worker);
+    worker();
+    for (auto& t : pool) t.join();
+    ::close(fd);
+    return err;
+}
+#endif
 }
 
 bool NativeDense::served_names(const std::vector<std::string>& shards, bool include_ple_key,
@@ -139,6 +210,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     err = "native dense: overlapping payload " + tensor.name; return false;
                 }
             }
+#if !defined(_WIN32)
+            std::vector<Upload> uploads;
+#endif
             for (const auto& tensor : gguf.tensors()) {
                 if (!eligible(tensor, include_ple_key)) continue;
                 if (!seen.insert(tensor.name).second) {
@@ -163,6 +237,11 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 void* allocation = nullptr;
                 auto status = cudaMalloc(&allocation, bytes);
                 DevicePtr data(allocation);
+#if !defined(_WIN32)
+                if (status == cudaSuccess && pread_uploads())
+                    uploads.push_back({data.get(), gguf.data_start() + tensor.offset, (uint64_t) bytes});
+                else
+#endif
                 if (status == cudaSuccess)
                     status = cudaMemcpy(data.get(), gguf.tensor_data(tensor), bytes, cudaMemcpyHostToDevice);
                 if (status != cudaSuccess) {
@@ -172,6 +251,12 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 total += bytes;
                 pending.push_back(Pending{&ref, (int) tensor.type, bytes, std::move(data)});
             }
+#if !defined(_WIN32)
+            if (!uploads.empty()) {
+                const std::string uerr = upload_from_file(path, uploads);
+                if (!uerr.empty()) { err = "native dense upload: " + uerr; return false; }
+            }
+#endif
         }
         if (pending.empty()) { err = "native dense: no supported GDN/QSA matrices in supplied shards"; return false; }
         void* allocation = nullptr;

@@ -38,6 +38,8 @@
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -176,6 +178,16 @@ bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t
 }
 
 }  // namespace detail
+
+void unpin_load_thread() {
+#if !defined(_WIN32)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    const long n = sysconf(_SC_NPROCESSORS_CONF);
+    for (long i = 0; i < n && i < CPU_SETSIZE; ++i) CPU_SET((int) i, &set);
+    (void) pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+#endif
+}
 
 namespace {
 
@@ -457,7 +469,14 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
 }
 
 void FileExpertSource::close() {
-    if (complement_arena_ != nullptr) {
+    if (complement_arena_ != nullptr && complement_anon_) {
+#if !defined(_WIN32)
+        if (complement_pinned_) (void) cudaHostUnregister(complement_arena_);
+        else if (complement_locked_ > 0)
+            strata::platform::unlock_resident((uint8_t*) complement_arena_ + complement_lock_off_, complement_locked_);
+        (void) munmap(complement_arena_, (size_t) complement_bytes_);
+#endif
+    } else if (complement_arena_ != nullptr) {
         if (complement_pinned_ && !complement_partial_) (void) cudaFreeHost(complement_arena_);
         else {
             if (complement_partial_) (void) cudaHostUnregister(complement_arena_);
@@ -488,6 +507,7 @@ void FileExpertSource::close() {
     complement_pin_limit_ = 0;
     complement_lock_off_ = 0;
     complement_ready_ = false;
+    complement_anon_ = false;
     complement_locked_ = 0;
     complement_lent_slots_ = 0;
     if (!maps_.empty()) {
@@ -571,6 +591,10 @@ bool FileExpertSource::open_gguf(std::string& err) {
     std::map<std::string, size_t> index;
     role_ptr_.assign((size_t) (3 * n_layers_), nullptr);
     role_bytes_.assign((size_t) (3 * n_layers_), 0);
+#if !defined(_WIN32)
+    role_fd_.assign((size_t) (3 * n_layers_), -1);
+    role_off_.assign((size_t) (3 * n_layers_), 0);
+#endif
     for (int64_t l = 0; l < n_layers_; ++l) {
         const auto& fm = lay.fmt[(size_t) l];
         const uint64_t per[3] = {fm.up_off, fm.up_off, lay.bytes[(size_t) l] - fm.down_off};
@@ -630,6 +654,10 @@ bool FileExpertSource::open_gguf(std::string& err) {
             }
             role_ptr_[i] = m.base + (size_t) at;
             role_bytes_[i] = per[r];
+#if !defined(_WIN32)
+            role_fd_[i] = m.fd;
+            role_off_[i] = at;
+#endif
         }
     }
     base_ = maps_.front().base;       // "opened"; mapped_blob answers nullptr in this mode
@@ -654,6 +682,51 @@ bool FileExpertSource::copy_from_files(int64_t layer, int64_t expert, uint8_t* d
     if (b == nullptr) return false;
     std::memcpy(dst, b, (size_t) layer_blob_bytes_[(size_t) layer]);
     return true;
+}
+
+bool FileExpertSource::read_blob(int64_t layer, int64_t expert, uint8_t* dst, int role) const {
+    if (dst == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_LOAD_PREAD");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    (void) on;
+#if !defined(_WIN32)
+    if (!on)
+#endif
+    {
+        if (role < 0 || role_ptr_.empty()) return copy_from_files(layer, expert, dst);
+        uint64_t at = 0;
+        for (int r = 0; r < role; ++r) at += role_bytes_[(size_t) (3 * layer + r)];
+        const size_t i = (size_t) (3 * layer + role);
+        std::memcpy(dst + at, role_ptr_[i] + (size_t) ((uint64_t) expert * role_bytes_[i]), (size_t) role_bytes_[i]);
+        return true;
+    }
+#if !defined(_WIN32)
+    auto read_all = [](int fd, uint8_t* to, uint64_t n, uint64_t at) {
+        while (n > 0) {
+            const ssize_t r = ::pread(fd, to, (size_t) n, (off_t) at);
+            if (r <= 0) return false;
+            to += r; at += (uint64_t) r; n -= (uint64_t) r;
+        }
+        return true;
+    };
+    if (!role_ptr_.empty()) {
+        uint64_t at = 0;
+        for (int r = 0; r < 3; ++r) {
+            const size_t i = (size_t) (3 * layer + r);
+            const uint64_t per = role_bytes_[i];
+            if ((role < 0 || r == role) &&
+                (role_fd_[i] < 0 || !read_all(role_fd_[i], dst + at, per, role_off_[i] + (uint64_t) expert * per)))
+                return false;
+            at += per;
+        }
+        return true;
+    }
+    if (mapped_blob(layer, expert) == nullptr || fd_ < 0) return false;   // the same bounds as the mapped copy
+    const uint64_t blob_bytes = layer_blob_bytes_[(size_t) layer];
+    return read_all(fd_, dst, blob_bytes, layer_offsets_[(size_t) layer] + (uint64_t) expert * blob_bytes);
+#endif
 }
 
 // A blob assembled from the three role slices.  The buffer of a (layer, expert) is reused for another only once
@@ -1142,8 +1215,18 @@ bool FileExpertSource::pin_cache_complement(
     uint64_t partial_pin = 0;   ///< CS-T: a registered prefix of a locked arena
     uint64_t lock_off = 0;      ///< where the working-set lock starts (after the registered prefix)
     std::string note;
+    bool anon = false;          ///< Linux: anonymous memory the copy touches, page-locked by cudaHostRegister after it
     auto release = [&]() {
         if (arena == nullptr) return;
+#if !defined(_WIN32)
+        if (anon) {
+            if (pinned_ok) (void) cudaHostUnregister(arena);
+            else if (locked > 0) strata::platform::unlock_resident((uint8_t*) arena, locked);
+            (void) munmap(arena, (size_t) bytes);
+            arena = nullptr;
+            return;
+        }
+#endif
         if (pinned_ok) (void) cudaFreeHost(arena);
         else {
             if (partial_pin > 0) (void) cudaHostUnregister(arena);
@@ -1156,7 +1239,25 @@ bool FileExpertSource::pin_cache_complement(
         std::fprintf(stderr, "FileExpertSource: allocating %.2f GiB %s cache complement\n",
                      (double) bytes / 1073741824.0, pin ? "page-locked" : "pageable resident");
         std::fflush(stderr);
+#if !defined(_WIN32)
+        // cudaHostAlloc zeroes and locks the whole arena on one thread before the copy starts: 19.7 s for 34.6 GiB
+        // on llm-server.  Anonymous memory is touched by the copy's threads instead and registered after it (1.8 s).
+        // STRATA_PIN_AFTER_COPY=0 is the A/B arm.
+        static const bool pin_after = [] {
+            const char* v = std::getenv("STRATA_PIN_AFTER_COPY");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        if (pin && pin_after) {
+            void* m = mmap(nullptr, (size_t) bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (m != MAP_FAILED) {
+                arena = m;
+                anon = true;
+            }
+        }
+        if (pin && !anon) {
+#else
         if (pin) {
+#endif
             const cudaError_t allocated = cudaHostAlloc(&arena, (size_t) bytes,
                                                          cudaHostAllocMapped | cudaHostAllocPortable);
             if (allocated == cudaSuccess) {
@@ -1271,16 +1372,21 @@ bool FileExpertSource::pin_cache_complement(
             const int64_t layer = next_layer.fetch_add(1);
             if (layer >= n_layers_ || failed.load()) return;
             const uint64_t blob_bytes = layer_blob_bytes_[(size_t) layer];
+            // the GGUF in place: one role tensor after another, so a thread reads one forward stream at a time.
+            // Interleaving gate/up/down gave 3 streams per thread, past ZFS's 8 prefetch streams per file with 6
+            // threads: the prefetcher thrashed (1.3-1.8x the bytes read, 1.45 GB/s against 2.3 for the GPU fill).
+            const int passes = gguf_mode() ? 3 : 1;
+            for (int role = 0; role < passes; ++role)
             for (int64_t expert = 0; expert < n_expert_; ++expert) {
                 const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
                 const uint64_t offset = offsets[index];
                 if (offset == kNoComplement) continue;
                 if (offset > bytes || blob_bytes > bytes - offset ||
-                    !copy_from_files(layer, expert, (uint8_t*) host + (size_t) offset)) {
+                    !read_blob(layer, expert, (uint8_t*) host + (size_t) offset, gguf_mode() ? role : -1)) {
                     fail("FileExpertSource: invalid blob bounds while building the cache complement");
                     return;
                 }
-                copied.fetch_add(blob_bytes);
+                if (role == passes - 1) copied.fetch_add(blob_bytes);
             }
 #if !defined(_WIN32)
             if (role_ptr_.empty()) {   // experts.bin; the GGUF in place leaves its pages to the OS
@@ -1310,9 +1416,15 @@ bool FileExpertSource::pin_cache_complement(
         }
     };
     {
-        const int threads = (int) std::max<int64_t>(1, std::min<int64_t>(6, n_layers_));
+        static const int load_threads = [] {
+            const char* v = std::getenv("STRATA_LOAD_THREADS");
+            return v != nullptr && std::atoi(v) > 0 ? std::atoi(v) : 6;
+        }();
+        const int threads = (int) std::max<int64_t>(1, std::min<int64_t>(load_threads, n_layers_));
         std::vector<std::thread> pool;
-        for (int i = 1; i < threads; ++i) pool.emplace_back(worker);
+        // off the session's one core: the session pins its host thread before this runs, and on Linux a thread
+        // inherits its creator's affinity - the copy's threads all shared CPU 0 (1.45 GB/s, any thread count)
+        for (int i = 1; i < threads; ++i) pool.emplace_back([&] { unpin_load_thread(); worker(); });
         worker();
         for (auto& t : pool) t.join();
     }
@@ -1322,6 +1434,48 @@ bool FileExpertSource::pin_cache_complement(
         release();
         return false;
     }
+    // STRATA_LOAD_VERIFY=1: every blob of the copy compared with the mapped file's (a test, minutes)
+    if (const char* v = std::getenv("STRATA_LOAD_VERIFY"); v != nullptr && std::atoi(v) != 0) {
+        std::unique_ptr<uint8_t[]> want(new uint8_t[(size_t) *std::max_element(layer_blob_bytes_.begin(), layer_blob_bytes_.end())]);
+        int64_t checked = 0;
+        for (size_t index = 0; index < offsets.size(); ++index) {
+            if (offsets[index] == kNoComplement) continue;
+            const int64_t layer = (int64_t) index / n_expert_, expert = (int64_t) index % n_expert_;
+            const uint64_t b = layer_blob_bytes_[(size_t) layer];
+            if (!copy_from_files(layer, expert, want.get()) ||
+                std::memcmp(want.get(), (const uint8_t*) host + (size_t) offsets[index], (size_t) b) != 0) {
+                err = "FileExpertSource: STRATA_LOAD_VERIFY: layer " + std::to_string(layer) + " expert " +
+                      std::to_string(expert) + " differs from the mapped file";
+                release();
+                return false;
+            }
+            ++checked;
+        }
+        std::fprintf(stderr, "FileExpertSource: STRATA_LOAD_VERIFY: %lld blobs equal to the mapped file\n",
+                     (long long) checked);
+    }
+#if !defined(_WIN32)
+    if (anon) {
+        if (cudaHostRegister(arena, (size_t) bytes, cudaHostRegisterMapped | cudaHostRegisterPortable) == cudaSuccess) {
+            void* alias = nullptr;
+            if (cudaHostGetDevicePointer(&alias, arena, 0) == cudaSuccess && alias != nullptr) {
+                device = (const uint8_t*) alias;
+                pinned_ok = true;
+                note = "page-locked and mapped (registered after the copy)";
+            } else {
+                (void) cudaGetLastError();
+                (void) cudaHostUnregister(arena);
+            }
+        } else {
+            (void) cudaGetLastError();
+        }
+        if (!pinned_ok) {   // as a refused cudaHostAlloc: the same bytes locked in the working set instead
+            const strata::platform::LockResult lr = strata::platform::lock_resident((uint8_t*) arena, bytes);
+            locked = lr.locked_bytes;
+            note = "page-locking refused after the copy; " + lr.note;
+        }
+    }
+#endif
 #if defined(_WIN32)
     // The mapped pages this process touched (the GPU cache's fill and this copy) leave its working set for the
     // standby list: VirtualUnlock on pages that are not locked does exactly that (it then reports ERROR_NOT_LOCKED).
@@ -1338,7 +1492,8 @@ bool FileExpertSource::pin_cache_complement(
     complement_pin_limit_ = pinned_ok ? bytes : partial_pin;
     complement_partial_ = !pinned_ok && partial_pin > 0;
     complement_locked_ = locked;
-    complement_lock_off_ = lock_off;
+    complement_lock_off_ = anon ? 0 : lock_off;
+    complement_anon_ = anon;
     complement_lent_slots_ = lend ? n_slots - keep_from : 0;
     complement_ready_ = true;
     std::fprintf(stderr, "FileExpertSource: %s cache complement ready: resident %.2f GiB, pinned %.2f GiB%s%s\n",

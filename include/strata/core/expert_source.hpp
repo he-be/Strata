@@ -46,6 +46,10 @@ namespace strata::core {
 class RemoteExperts;
 struct LoadStats;
 
+/// Startup loaders' threads (the GPU caches' fill, the RAM copy): every CPU, not the creator's affinity.  The session
+/// pins its host thread to one core, and on Linux a new thread inherits that (Windows threads take the process mask).
+void unpin_load_thread();
+
 namespace detail {
 
 /// Sentinel used by the pure complement planner for a blob that remains in the mmap fallback.
@@ -478,6 +482,11 @@ public:
     bool pcie_layer(int64_t layer) const override;
     bool transient(int64_t layer, int64_t expert) const override;
     bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
+    /// Startup reads (the GPU caches' fill, the RAM copy): the blob's bytes read with pread() into `dst`, not
+    /// through the mapping - a mapped read is one 4 KB fault at a time (0.65 GB/s on one thread against 2.1 GB/s
+    /// read, llm-server ZFS).  Thread-safe; Windows, or STRATA_LOAD_PREAD=0, copies from the mapping.  With
+    /// `role` 0-2 (the GGUF in place) only that role's slice is written, at its place in the blob.
+    bool read_blob(int64_t layer, int64_t expert, uint8_t* dst, int role = -1) const;
     /// CS-T: advances the assembled blobs' age (see staged_blob).
     void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
     /// CS-T: the GGUF in place assembles the missed experts on `fetch_threads_` threads.
@@ -518,6 +527,10 @@ private:
     std::vector<Map> maps_;
     std::vector<const uint8_t*> role_ptr_;    ///< 3 x n_layers: gate / up / down of the layer's expert 0
     std::vector<uint64_t> role_bytes_;        ///< 3 x n_layers: bytes per expert of that role
+#if !defined(_WIN32)
+    std::vector<int> role_fd_;                ///< 3 x n_layers: the shard role_ptr_ points into, for read_blob
+    std::vector<uint64_t> role_off_;          ///< 3 x n_layers: role_ptr_'s offset in that shard
+#endif
     // the blobs assembled for `blob()`: a small pool of buffers, one per recent (layer, expert).  A buffer is
     // reused only once `kStageAge` layer changes have passed since its blob was last asked for, so a pointer holds
     // through the layer it was asked in and the next ones (the pool computes a layer's misses before the next).
@@ -556,6 +569,7 @@ private:
     uint64_t complement_pin_limit_ = 0;
     uint64_t complement_lock_off_ = 0;        ///< the working-set lock covers [lock_off, lock_off + locked)
     bool complement_ready_ = false;
+    bool complement_anon_ = false;            ///< Linux: an anonymous mapping, registered after the copy (munmap)
     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)
     int64_t complement_lent_slots_ = 0;
     std::vector<const uint8_t*> override_;    ///< staged exchanges: an evicted expert read from its exchange buffer

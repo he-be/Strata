@@ -2914,6 +2914,76 @@ int main(int argc, char** argv) {
     // ONCE: with `slots` pairs and `slots` slots the cache is full when this returns, so the decode-time
     // admission finds no room and every non-profiled expert stays a CPU miss.  That is what makes the profile
     // the policy rather than a hint.
+    // The startup fill of a GPU expert cache: `jobs` (slot, layer, expert) read with pread on STRATA_LOAD_THREADS
+    // (default 8) threads, each through its own pinned buffer and stream.  The serial fill read the mapped GGUF one
+    // 4 KB fault at a time (0.65 GB/s: 128 s for the 37 GiB of llm-server's two caches).  A source that is not the
+    // files (the arena), or STRATA_LOAD_THREADS=1, keeps the serial blob() path.
+    auto fill_slots = [&](strata::core::ExpertCache& cache, int dev, const std::vector<std::array<int32_t, 3>>& jobs,
+                          std::string& ferr) -> bool {
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        static const int load_threads = [] {
+            const char* v = std::getenv("STRATA_LOAD_THREADS");
+            return v != nullptr && std::atoi(v) > 0 ? std::atoi(v) : 8;
+        }();
+        const auto* fsrc = dynamic_cast<const strata::core::FileExpertSource*>(srcp);
+        if (fsrc == nullptr || load_threads <= 1) {
+            for (const auto& j : jobs) {
+                const uint8_t* b = srcp->blob(j[1], j[2]);
+                if (b == nullptr || !cache.fill_slot_blocking(j[0], b, ferr, (int64_t) lay.blob_bytes(j[1]))) {
+                    if (ferr.empty()) ferr = "no blob for a profiled pair";
+                    return false;
+                }
+            }
+            return true;
+        }
+        std::atomic<size_t> next{0};
+        std::atomic<bool> bad{false};
+        std::mutex mu;   // fill_slot counts its fills unguarded
+        auto worker = [&] {
+            void* buf = nullptr;
+            cudaStream_t s = nullptr;
+            std::string werr;
+            if (cudaSetDevice(dev) != cudaSuccess || cudaHostAlloc(&buf, (size_t) lay.max_blob, cudaHostAllocDefault) !=
+                    cudaSuccess || cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess) {
+                werr = std::string("staging buffer: ") + cudaGetErrorString(cudaGetLastError());
+            }
+            for (size_t i; werr.empty() && !bad.load() && (i = next.fetch_add(1)) < jobs.size();) {
+                const auto& j = jobs[i];
+                if (!fsrc->read_blob(j[1], j[2], (uint8_t*) buf)) {
+                    werr = "cannot read layer " + std::to_string(j[1]) + " expert " + std::to_string(j[2]);
+                    break;
+                }
+                {
+                    std::lock_guard<std::mutex> lk(mu);
+                    if (!cache.fill_slot(j[0], (const uint8_t*) buf, s, werr, (int64_t) lay.blob_bytes(j[1]))) break;
+                }
+                const cudaError_t e = cudaStreamSynchronize(s);
+                if (e != cudaSuccess) werr = cudaGetErrorString(e);
+            }
+            if (s != nullptr) (void) cudaStreamDestroy(s);
+            if (buf != nullptr) (void) cudaFreeHost(buf);
+            if (!werr.empty()) {
+                std::lock_guard<std::mutex> lk(mu);
+                if (ferr.empty()) ferr = werr;
+                bad.store(true);
+            }
+        };
+        std::vector<std::thread> pool;
+        for (int t = 1; t < load_threads; ++t) pool.emplace_back([&] { strata::core::unpin_load_thread(); worker(); });
+        worker();
+        for (auto& t : pool) t.join();
+        (void) cudaSetDevice(dev);
+        if (bad.load()) return false;
+        // STRATA_LOAD_VERIFY=1: every slot read back and compared with the mapped file's blob (a test, minutes)
+        if (const char* v = std::getenv("STRATA_LOAD_VERIFY"); v != nullptr && std::atoi(v) != 0) {
+            for (const auto& j : jobs)
+                if (!cache.verify_slot(j[0], srcp->blob(j[1], j[2]), ferr, (int64_t) lay.blob_bytes(j[1])))
+                    return false;
+            std::fprintf(stderr, "strata generate: STRATA_LOAD_VERIFY: CUDA%d, %zu slots equal to the mapped file\n",
+                         dev, jobs.size());
+        }
+        return true;
+    };
     int64_t prefilled = 0;
     if (!profile.empty() && srcp != nullptr) {
         // #369 (dag08): per layer, a full layer skips only its own pairs - each layer takes its hottest experts until
@@ -2921,21 +2991,22 @@ int main(int argc, char** argv) {
         const bool per_layer = xcache.per_layer_admission();
         const int64_t want = per_layer ? (int64_t) profile.size()
                                        : std::min<int64_t>((int64_t) profile.size(), xcache.slots());
+        std::vector<std::array<int32_t, 3>> jobs;
         for (int64_t i = 0; i < want; ++i) {
             const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
             if (slot == strata::core::kNotResident) {
                 if (per_layer) continue;
                 break;
             }
-            const uint8_t* b = srcp->blob(profile[(size_t) i].first, profile[(size_t) i].second);
-            if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
-                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first))) {
-                std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
-                             (long long) i, err.c_str());
-                return 1;
-            }
-            ++prefilled;
+            jobs.push_back({slot, profile[(size_t) i].first, profile[(size_t) i].second});
         }
+        int dev0 = 0;
+        (void) cudaGetDevice(&dev0);
+        if (!fill_slots(xcache, dev0, jobs, err)) {
+            std::fprintf(stderr, "strata generate: the profile fill failed: %s\n", err.c_str());
+            return 1;
+        }
+        prefilled = (int64_t) jobs.size();
         // **AND ONE SLOT IS READ BACK AND COMPARED.**  A residency table that is right about indices and wrong
         // about bytes produces a plausible token, which is this project's most expensive failure mode; the
         // cache's own `verify_slot` is the check and it costs one 1.38 MB D2H at startup.
@@ -2972,19 +3043,19 @@ int main(int argc, char** argv) {
                          sized.empty() ? "no room" : err.c_str());
             return 1;
         }
-        int64_t filled = 0;
+        std::vector<std::array<int32_t, 3>> jobs;
         for (const auto& pr : st.profile) {
-            if (filled >= st.cache.slots()) break;
+            if ((int64_t) jobs.size() >= st.cache.slots()) break;
             const int32_t slot = st.cache.admit(pr.first, pr.second);
             if (slot == strata::core::kNotResident) break;
-            const uint8_t* b = srcp->blob(pr.first, pr.second);
-            if (b == nullptr || !st.cache.fill_slot_blocking(slot, b, err, (int64_t) lay.blob_bytes(pr.first))) {
-                std::fprintf(stderr, "strata generate: layer split, CUDA%d profile fill failed at pair %lld: %s\n",
-                             st.dev, (long long) filled, err.c_str());
-                return 1;
-            }
-            ++filled;
+            jobs.push_back({slot, pr.first, pr.second});
         }
+        if (!fill_slots(st.cache, st.dev, jobs, err)) {
+            std::fprintf(stderr, "strata generate: layer split, CUDA%d profile fill failed: %s\n", st.dev,
+                         err.c_str());
+            return 1;
+        }
+        const int64_t filled = (int64_t) jobs.size();
         if (filled == 0 || !st.cache.verify_slot(st.cache.slot_of(st.profile[0].first, st.profile[0].second),
                                                  srcp->blob(st.profile[0].first, st.profile[0].second), err,
                                                  (int64_t) lay.blob_bytes(st.profile[0].first))) {
